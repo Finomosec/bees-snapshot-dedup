@@ -1,0 +1,5 @@
+btrfs-snapshot-dedup
+bees-snapshot-dedup
+candidates.fdupes
+candidates.done
+*.log
