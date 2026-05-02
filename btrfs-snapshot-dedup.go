@@ -615,6 +615,11 @@ type counters struct {
 }
 
 func main() {
+	if os.Geteuid() != 0 {
+		fmt.Fprintf(os.Stderr, "ERROR: btrfs-snapshot-dedup requires root (uses BTRFS ioctls). Run with sudo.\n")
+		os.Exit(1)
+	}
+
 	workers := flag.Int("workers", DEDUP_WORKERS, "number of parallel dedup workers")
 	startAt := flag.String("start-at", "", "resume: skip files until this relative path (lexicographic)")
 	flag.Parse()
