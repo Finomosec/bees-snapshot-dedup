@@ -614,36 +614,41 @@ type counters struct {
 	bytesSaved atomic.Int64
 }
 
-func main() {
-	if os.Geteuid() != 0 {
-		fmt.Fprintf(os.Stderr, "ERROR: btrfs-snapshot-dedup requires root (uses BTRFS ioctls). Run with sudo.\n")
-		os.Exit(1)
-	}
+func printUsage() {
+	fmt.Fprintf(os.Stderr, "btrfs-snapshot-dedup v%s\n\n", VERSION)
+	fmt.Fprintf(os.Stderr, "Usage: %s [options] <mount> <subvol> [find-filter...]\n\n", os.Args[0])
+	fmt.Fprintf(os.Stderr, "Options:\n")
+	flag.PrintDefaults()
+	fmt.Fprintf(os.Stderr, "\nEverything after <mount> <subvol> is passed to find(1) as filter.\n")
+	fmt.Fprintf(os.Stderr, "Default (no filter): find <path> -type f\n\n")
+	fmt.Fprintf(os.Stderr, "Examples:\n")
+	fmt.Fprintf(os.Stderr, "  # Dedup all files\n")
+	fmt.Fprintf(os.Stderr, "  sudo %s /mnt/btrfs mysubvol\n\n", os.Args[0])
+	fmt.Fprintf(os.Stderr, "  # Only large files (>= 100MB)\n")
+	fmt.Fprintf(os.Stderr, "  sudo %s /mnt/btrfs mysubvol -size +100M\n\n", os.Args[0])
+	fmt.Fprintf(os.Stderr, "  # Only text/config files\n")
+	fmt.Fprintf(os.Stderr, "  sudo %s /mnt/btrfs mysubvol '(' -iname '*.txt' -o -iname '*.json' ')'\n\n", os.Args[0])
+	fmt.Fprintf(os.Stderr, "  # Combine size + extension filter\n")
+	fmt.Fprintf(os.Stderr, "  sudo %s /mnt/btrfs mysubvol -size +1M '(' -iname '*.log' -o -iname '*.txt' ')'\n\n", os.Args[0])
+	fmt.Fprintf(os.Stderr, "  # Resume after interrupt\n")
+	fmt.Fprintf(os.Stderr, "  sudo %s -start-at 'path/to/last/file' /mnt/btrfs mysubvol\n", os.Args[0])
+}
 
+func main() {
 	workers := flag.Int("workers", DEDUP_WORKERS, "number of parallel dedup workers")
 	startAt := flag.String("start-at", "", "resume: skip files until this relative path (lexicographic)")
+	flag.Usage = printUsage
 	flag.Parse()
 
 	// First two positional args are mount + subvol, rest goes to find(1)
 	args := flag.Args()
 	if len(args) < 2 {
-		fmt.Fprintf(os.Stderr, "btrfs-snapshot-dedup v%s\n\n", VERSION)
-		fmt.Fprintf(os.Stderr, "Usage: %s [options] <mount> <subvol> [find-filter...]\n\n", os.Args[0])
-		fmt.Fprintf(os.Stderr, "Options:\n")
-		flag.PrintDefaults()
-		fmt.Fprintf(os.Stderr, "\nEverything after <mount> <subvol> is passed to find(1) as filter.\n")
-		fmt.Fprintf(os.Stderr, "Default (no filter): find <path> -type f\n\n")
-		fmt.Fprintf(os.Stderr, "Examples:\n")
-		fmt.Fprintf(os.Stderr, "  # Dedup all files\n")
-		fmt.Fprintf(os.Stderr, "  sudo %s /mnt/btrfs mysubvol\n\n", os.Args[0])
-		fmt.Fprintf(os.Stderr, "  # Only large files (>= 100MB)\n")
-		fmt.Fprintf(os.Stderr, "  sudo %s /mnt/btrfs mysubvol -size +100M\n\n", os.Args[0])
-		fmt.Fprintf(os.Stderr, "  # Only text/config files\n")
-		fmt.Fprintf(os.Stderr, "  sudo %s /mnt/btrfs mysubvol '(' -iname '*.txt' -o -iname '*.json' ')'\n\n", os.Args[0])
-		fmt.Fprintf(os.Stderr, "  # Combine size + extension filter\n")
-		fmt.Fprintf(os.Stderr, "  sudo %s /mnt/btrfs mysubvol -size +1M '(' -iname '*.log' -o -iname '*.txt' ')'\n\n", os.Args[0])
-		fmt.Fprintf(os.Stderr, "  # Resume after interrupt\n")
-		fmt.Fprintf(os.Stderr, "  sudo %s -start-at 'path/to/last/file' /mnt/btrfs mysubvol\n", os.Args[0])
+		printUsage()
+		os.Exit(1)
+	}
+
+	if os.Geteuid() != 0 {
+		fmt.Fprintf(os.Stderr, "ERROR: btrfs-snapshot-dedup requires root (uses BTRFS ioctls). Run with sudo.\n")
 		os.Exit(1)
 	}
 	mount := args[0]
