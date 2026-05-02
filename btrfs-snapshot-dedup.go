@@ -48,7 +48,7 @@ var (
 	DEDUPE_RANGE_INFO_SIZE = int(C.DEDUPE_RANGE_INFO_SIZE)
 )
 
-const VERSION = "0.3.1"
+const VERSION = "0.4.0"
 
 const (
 	QUEUE_LIMIT    = 10000
@@ -396,6 +396,48 @@ type snapshotInfo struct {
 	creationTime int64  // epoch seconds
 }
 
+// subvolFullInfo carries everything we need for nested-subvol-aware snapshot lookup.
+type subvolFullInfo struct {
+	subvolID     uint64
+	uuid         [16]byte
+	parentUUID   [16]byte // zero for non-snapshot subvols
+	relPath      string   // resolved path relative to mount; may be "" if resolution failed
+	creationTime int64
+}
+
+// snapEntry is one snapshot of a particular live subvol, sorted oldest-first per group.
+type snapEntry struct {
+	absPath      string
+	creationTime int64
+}
+
+// liveSubvolEntry: one subvol within the live tree, with its snapshots
+// (= subvols whose parent_uuid matches this subvol's uuid).
+// relPath is the path of THIS subvol relative to the mount.
+type liveSubvolEntry struct {
+	relPath   string // e.g. "BackupComputer/BlackTower"
+	rootID    uint64
+	snapshots []snapEntry // oldest first
+}
+
+// subvolMap holds liveSubvolEntries sorted by relPath length DESC for longest-prefix match.
+type subvolMap []liveSubvolEntry
+
+// findForRel locates the liveSubvolEntry that owns this rel-path (relative to mount).
+// Returns the entry and the path within that subvol (with leading slash stripped).
+func (m subvolMap) findForRel(rel string) (*liveSubvolEntry, string) {
+	for i := range m {
+		p := m[i].relPath
+		if rel == p {
+			return &m[i], ""
+		}
+		if strings.HasPrefix(rel, p+"/") {
+			return &m[i], rel[len(p)+1:]
+		}
+	}
+	return nil, rel
+}
+
 // uuidToString formats a 16-byte UUID as "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
 func uuidToString(b []byte) string {
 	if len(b) < 16 {
@@ -562,6 +604,123 @@ func getSubvolSnapshots(mountFd int, mount string, targetUUID [16]byte) ([]snaps
 	return snapshots, nil
 }
 
+// enumerateAllSubvols scans the root tree once and returns metadata for every
+// subvolume on the filesystem (including nested subvols and snapshots).
+// Path resolution is deferred to the caller (only resolve what's needed).
+func enumerateAllSubvols(mountFd int, mount string) ([]subvolFullInfo, error) {
+	le := binary.LittleEndian
+	var result []subvolFullInfo
+
+	const rootItemUUIDOff = 247       // btrfs_root_item.uuid offset
+	const rootItemParentUUIDOff = 263 // btrfs_root_item.parent_uuid offset
+	const rootItemOtimeOff = 339      // btrfs_timespec sec
+	const rootItemMinSize = 353       // need fields up through otime.sec
+
+	type basic struct {
+		subvolID   uint64
+		uuid       [16]byte
+		parentUUID [16]byte
+		otime      int64
+		legacy     bool // true → root_item too small, fall back to GET_SUBVOL_INFO
+	}
+	var entries []basic
+	seen := make(map[uint64]bool)
+
+	var minObjID uint64 = 256
+	for {
+		buf := make([]byte, SEARCH_KEY_SIZE+8+65536)
+		le.PutUint64(buf[0:8], 1) // root tree
+		le.PutUint64(buf[8:16], minObjID)
+		le.PutUint64(buf[16:24], ^uint64(0))
+		le.PutUint64(buf[24:32], 0)
+		le.PutUint64(buf[32:40], ^uint64(0))
+		le.PutUint64(buf[40:48], 0)
+		le.PutUint64(buf[48:56], ^uint64(0))
+		le.PutUint32(buf[56:60], BTRFS_ROOT_ITEM_KEY)
+		le.PutUint32(buf[60:64], BTRFS_ROOT_ITEM_KEY)
+		le.PutUint32(buf[64:68], ^uint32(0))
+		le.PutUint64(buf[SEARCH_KEY_SIZE:SEARCH_KEY_SIZE+8], 65536)
+
+		_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(mountFd),
+			IOC_TREE_SEARCH_V2, uintptr(unsafe.Pointer(&buf[0])))
+		if errno != 0 {
+			break
+		}
+
+		nrItems := le.Uint32(buf[64:68])
+		if nrItems == 0 {
+			break
+		}
+
+		pos := SEARCH_KEY_SIZE + 8
+		var lastObjID uint64
+		for i := uint32(0); i < nrItems; i++ {
+			objID := le.Uint64(buf[pos+8 : pos+16])
+			hdrLen := le.Uint32(buf[pos+28 : pos+32])
+			pos += SEARCH_HEADER_SIZE
+			lastObjID = objID
+
+			if !seen[objID] {
+				seen[objID] = true
+				if int(hdrLen) >= rootItemMinSize {
+					data := buf[pos : pos+int(hdrLen)]
+					var b basic
+					b.subvolID = objID
+					copy(b.uuid[:], data[rootItemUUIDOff:rootItemUUIDOff+16])
+					copy(b.parentUUID[:], data[rootItemParentUUIDOff:rootItemParentUUIDOff+16])
+					b.otime = int64(le.Uint64(data[rootItemOtimeOff : rootItemOtimeOff+8]))
+					entries = append(entries, b)
+				} else {
+					entries = append(entries, basic{subvolID: objID, legacy: true})
+				}
+			}
+			pos += int(hdrLen)
+		}
+		minObjID = lastObjID + 1
+		if minObjID == 0 {
+			break
+		}
+	}
+
+	// Resolve legacy entries via GET_SUBVOL_INFO (need a path first)
+	for i, e := range entries {
+		if !e.legacy {
+			continue
+		}
+		relPath := resolveSubvolPath(mountFd, mount, e.subvolID)
+		if relPath == "" {
+			continue
+		}
+		fd, err := syscall.Open(mount+"/"+relPath, syscall.O_RDONLY, 0)
+		if err != nil {
+			continue
+		}
+		info, err := getSubvolInfo(fd)
+		syscall.Close(fd)
+		if err != nil {
+			continue
+		}
+		for k := 0; k < 16; k++ {
+			entries[i].uuid[k] = byte(info.uuid[k])
+			entries[i].parentUUID[k] = byte(info.parent_uuid[k])
+		}
+		entries[i].otime = int64(info.otime.sec)
+	}
+
+	// Resolve paths for all (skip if subprocess fails — those entries get relPath="")
+	for _, e := range entries {
+		relPath := resolveSubvolPath(mountFd, mount, e.subvolID)
+		result = append(result, subvolFullInfo{
+			subvolID:     e.subvolID,
+			uuid:         e.uuid,
+			parentUUID:   e.parentUUID,
+			relPath:      relPath,
+			creationTime: e.otime,
+		})
+	}
+	return result, nil
+}
+
 // resolveSubvolPath resolves a subvolume ID to its path relative to the mount
 // Uses BTRFS_IOC_INO_LOOKUP with treeid=subvolID, objectid=256 (FIRST_FREE_OBJECTID)
 // then walks up via ROOT_BACKREF to build the full path.
@@ -631,7 +790,9 @@ func printUsage() {
 	fmt.Fprintf(os.Stderr, "  # Combine size + extension filter\n")
 	fmt.Fprintf(os.Stderr, "  sudo %s /mnt/btrfs mysubvol -size +1M '(' -iname '*.log' -o -iname '*.txt' ')'\n\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "  # Resume after interrupt\n")
-	fmt.Fprintf(os.Stderr, "  sudo %s -start-at 'path/to/last/file' /mnt/btrfs mysubvol\n", os.Args[0])
+	fmt.Fprintf(os.Stderr, "  sudo %s -start-at 'path/to/last/file' /mnt/btrfs mysubvol\n\n", os.Args[0])
+	fmt.Fprintf(os.Stderr, "  # Stay on the start subvol only — skip nested subvols (find -xdev)\n")
+	fmt.Fprintf(os.Stderr, "  sudo %s /mnt/btrfs mysubvol -xdev\n", os.Args[0])
 }
 
 func main() {
@@ -684,51 +845,112 @@ func main() {
 	}
 	defer syscall.Close(mountFd)
 
-	// Find all snapshots via root tree scan + GET_SUBVOL_INFO (stable kernel API, no text parsing)
-	fmt.Fprintf(os.Stderr, "Scanning for snapshots of %s...", subvol)
-	snapInfos, err := getSubvolSnapshots(mountFd, mount, subvolUUID)
+	// Enumerate ALL subvols on the FS (one tree-search pass) so we can handle
+	// nested subvols inside the live tree — their snapshots have a different
+	// parent_uuid and live elsewhere on disk.
+	fmt.Fprintf(os.Stderr, "Scanning subvolumes...")
+	allSubvols, err := enumerateAllSubvols(mountFd, mount)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "\nERROR: %v\n", err)
 		os.Exit(1)
 	}
-	snapCount := len(snapInfos)
-	if snapCount == 0 {
-		fmt.Fprintf(os.Stderr, "\nERROR: no snapshots found\n")
-		os.Exit(1)
-	}
-	fmt.Fprintf(os.Stderr, " %d found.\n", snapCount)
+	fmt.Fprintf(os.Stderr, " %d total.\n", len(allSubvols))
 
-	// Verify snapshots are accessible under the mount point
-	testSnap := mount + "/" + snapInfos[0].relPath
-	if _, err := os.Stat(testSnap); err != nil {
-		fmt.Fprintf(os.Stderr, "ERROR: snapshot not accessible: %s\n", testSnap)
-		fmt.Fprintf(os.Stderr, "Snapshots are resolved relative to the btrfs top-level.\n")
-		fmt.Fprintf(os.Stderr, "If you use subvolume mounts (e.g. subvol=@), mount with subvolid=5 instead:\n")
-		fmt.Fprintf(os.Stderr, "  mount -o subvolid=5 /dev/... /mnt/toplevel\n")
-		fmt.Fprintf(os.Stderr, "  %s /mnt/toplevel %s\n", os.Args[0], subvol)
-		os.Exit(1)
-	}
-
-	// Build snapshot absolute paths + subvol path cache
-	type snapEntry struct {
-		absPath      string
-		creationTime int64
-	}
-	allSnaps := make([]snapEntry, snapCount)
-	subvolCache := make(map[uint64]string) // root ID → subvol path (for logicalResolve)
-	for i, si := range snapInfos {
-		allSnaps[i] = snapEntry{
-			absPath:      mount + "/" + si.relPath,
-			creationTime: si.creationTime,
+	// Index by uuid for parent_uuid → snapshot lookup
+	uuidToSnaps := make(map[[16]byte][]snapEntry)
+	subvolCache := make(map[uint64]string) // root ID → relPath (for logicalResolve)
+	for _, sv := range allSubvols {
+		if sv.relPath != "" {
+			subvolCache[sv.subvolID] = sv.relPath
 		}
-		subvolCache[si.subvolID] = si.relPath
+		// non-snapshots have parent_uuid == 0
+		var zero [16]byte
+		if sv.parentUUID == zero {
+			continue
+		}
+		if sv.relPath == "" {
+			continue
+		}
+		uuidToSnaps[sv.parentUUID] = append(uuidToSnaps[sv.parentUUID], snapEntry{
+			absPath:      mount + "/" + sv.relPath,
+			creationTime: sv.creationTime,
+		})
+	}
+
+	// Build the subvol-map for the live tree: start subvol + every subvol
+	// nested under it. relPath comparison is against the subvol's path
+	// relative to mount.
+	var liveMap subvolMap
+	totalSnaps := 0
+	for _, sv := range allSubvols {
+		if sv.relPath == "" {
+			continue
+		}
+		// "subvol" is the start subvol's relPath relative to mount. Match exactly
+		// or as prefix (with separator).
+		if sv.relPath != subvol && !strings.HasPrefix(sv.relPath, subvol+"/") {
+			continue
+		}
+		// non-snapshot subvols only — snapshots themselves shouldn't be dedup targets
+		var zero [16]byte
+		if sv.parentUUID != zero {
+			continue
+		}
+		snaps := uuidToSnaps[sv.uuid]
+		sort.Slice(snaps, func(i, j int) bool {
+			return snaps[i].creationTime < snaps[j].creationTime
+		})
+		liveMap = append(liveMap, liveSubvolEntry{
+			relPath:   sv.relPath,
+			rootID:    sv.subvolID,
+			snapshots: snaps,
+		})
+		totalSnaps += len(snaps)
+	}
+	if len(liveMap) == 0 {
+		fmt.Fprintf(os.Stderr, "ERROR: no subvolumes found under %s\n", subvol)
+		os.Exit(1)
+	}
+	if totalSnaps == 0 {
+		fmt.Fprintf(os.Stderr, "ERROR: no snapshots found for any subvol under %s\n", subvol)
+		os.Exit(1)
+	}
+
+	// Sort by relPath length DESC so longest prefix wins in findForRel
+	sort.Slice(liveMap, func(i, j int) bool {
+		return len(liveMap[i].relPath) > len(liveMap[j].relPath)
+	})
+
+	// Verify snapshots are accessible — pick the first subvol with snapshots
+	for _, e := range liveMap {
+		if len(e.snapshots) > 0 {
+			testSnap := e.snapshots[0].absPath
+			if _, err := os.Stat(testSnap); err != nil {
+				fmt.Fprintf(os.Stderr, "ERROR: snapshot not accessible: %s\n", testSnap)
+				fmt.Fprintf(os.Stderr, "Snapshots are resolved relative to the btrfs top-level.\n")
+				fmt.Fprintf(os.Stderr, "If you use subvolume mounts (e.g. subvol=@), mount with subvolid=5 instead:\n")
+				fmt.Fprintf(os.Stderr, "  mount -o subvolid=5 /dev/... /mnt/toplevel\n")
+				fmt.Fprintf(os.Stderr, "  %s /mnt/toplevel %s\n", os.Args[0], subvol)
+				os.Exit(1)
+			}
+			break
+		}
 	}
 
 	fmt.Fprintf(os.Stderr, "btrfs-snapshot-dedup v%s\n", VERSION)
 	fmt.Fprintf(os.Stderr, "Mount:    %s\n", mount)
-	fmt.Fprintf(os.Stderr, "Subvol:   %s (id=%d)\n", subvol, subvolID)
-	fmt.Fprintf(os.Stderr, "Snapshots: %d (%s .. %s)\n", snapCount,
-		snapInfos[0].relPath, snapInfos[snapCount-1].relPath)
+	fmt.Fprintf(os.Stderr, "Subvol:   %s (id=%d) + %d nested subvol(s)\n",
+		subvol, subvolID, len(liveMap)-1)
+	fmt.Fprintf(os.Stderr, "Snapshots: %d total across %d subvol(s)\n",
+		totalSnaps, len(liveMap))
+	for _, e := range liveMap {
+		if len(e.snapshots) == 0 {
+			fmt.Fprintf(os.Stderr, "  %s — (no snapshots)\n", e.relPath)
+		} else {
+			fmt.Fprintf(os.Stderr, "  %s — %d snapshots\n", e.relPath, len(e.snapshots))
+		}
+	}
+	_ = subvolUUID
 	if len(findFilter) > 0 {
 		fmt.Fprintf(os.Stderr, "Filter:   %s\n", strings.Join(findFilter, " "))
 	}
@@ -746,19 +968,25 @@ func main() {
 	fmt.Fprintln(os.Stderr, "══════════════════════════════════════════════════════════════════════════════")
 
 	// Binary search: find oldest snapshot containing a file
-	findOldestSnap := func(rel string) int {
-		hi := snapCount - 1
-		if !fileExists(allSnaps[hi].absPath + "/" + rel) {
+	// snaps is the per-subvol snapshot list (oldest-first); subRel is the
+	// path within that subvol.
+	findOldestSnap := func(snaps []snapEntry, subRel string) int {
+		n := len(snaps)
+		if n == 0 {
 			return -1
 		}
-		if fileExists(allSnaps[0].absPath + "/" + rel) {
+		hi := n - 1
+		if !fileExists(snaps[hi].absPath + "/" + subRel) {
+			return -1
+		}
+		if fileExists(snaps[0].absPath + "/" + subRel) {
 			return 0
 		}
 		lo := 0
 		result := -1
 		for lo <= hi {
 			mid := (lo + hi) / 2
-			if fileExists(allSnaps[mid].absPath + "/" + rel) {
+			if fileExists(snaps[mid].absPath + "/" + subRel) {
 				result = mid
 				hi = mid - 1
 			} else {
@@ -946,18 +1174,27 @@ func main() {
 
 	processFile := func(file string) {
 		cnt.checked++
-		rel := strings.TrimPrefix(file, live+"/")
-		lastFile = rel
+		// rel is the file's path relative to mount (not relative to start subvol),
+		// e.g. "BackupComputer/BlackTower/foo/bar.txt".
+		relMount := strings.TrimPrefix(file, mount+"/")
+		lastFile = strings.TrimPrefix(file, live+"/")
 
-		// Step 1: Find in oldest snapshot
-		snapIdx := findOldestSnap(rel)
+		// Determine which (live) subvol owns this file → use that subvol's snapshots
+		owner, subRel := liveMap.findForRel(relMount)
+		if owner == nil || len(owner.snapshots) == 0 {
+			cnt.notFound++
+			return
+		}
+		snaps := owner.snapshots
 
+		// Step 1: Find in oldest snapshot of the owning subvol
+		snapIdx := findOldestSnap(snaps, subRel)
 		if snapIdx < 0 {
 			cnt.notFound++
 			return
 		}
 
-		snap := allSnaps[snapIdx].absPath + "/" + rel
+		snap := snaps[snapIdx].absPath + "/" + subRel
 
 		// Step 2: Size check
 		sizeLive, _ := getFileSize(file)
@@ -978,11 +1215,11 @@ func main() {
 		// === Candidate! ===
 		cnt.candidates++
 
-		// Step 4: Walk all snapshots, collect extents, group by unique extent
+		// Step 4: Walk all snapshots OF THIS SUBVOL, collect extents
 		group := map[string]bool{file: true}
 		uniqueExtents := make(map[uint64]bool) // physical offsets != live extent
-		for _, s := range allSnaps {
-			sf := s.absPath + "/" + rel
+		for _, s := range snaps {
+			sf := s.absPath + "/" + subRel
 			if !fileExists(sf) {
 				continue
 			}
