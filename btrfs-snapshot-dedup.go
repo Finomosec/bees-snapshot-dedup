@@ -48,7 +48,7 @@ var (
 	DEDUPE_RANGE_INFO_SIZE = int(C.DEDUPE_RANGE_INFO_SIZE)
 )
 
-const VERSION = "0.3.0"
+const VERSION = "0.3.1"
 
 const (
 	QUEUE_LIMIT    = 10000
