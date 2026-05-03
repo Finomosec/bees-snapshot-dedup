@@ -335,9 +335,22 @@ func fideduperange(srcPath string, dstPaths []string, numUniqueExtents int) (int
 	savedBytes := int64(numUniqueExtents) * srcSize
 
 	deduped := 0
-	// Process in chunks of 120 dests (4KB page limit)
-	for i := 0; i < len(dstPaths); i += 120 {
-		end := i + 120
+	// Batch by: max 120 dests (page limit) AND max ~2GiB total data per batch.
+	// This prevents FIDEDUPERANGE from blocking for hours on large files × many dests.
+	const maxBatchBytes = 2 * 1024 * 1024 * 1024 // 2 GiB
+	maxDestsPerBatch := 120
+	if srcSize > 0 {
+		sizeLimit := int(maxBatchBytes / srcSize)
+		if sizeLimit < 1 {
+			sizeLimit = 1
+		}
+		if sizeLimit < maxDestsPerBatch {
+			maxDestsPerBatch = sizeLimit
+		}
+	}
+
+	for i := 0; i < len(dstPaths); i += maxDestsPerBatch {
+		end := i + maxDestsPerBatch
 		if end > len(dstPaths) {
 			end = len(dstPaths)
 		}
