@@ -48,7 +48,7 @@ var (
 	DEDUPE_RANGE_INFO_SIZE = int(C.DEDUPE_RANGE_INFO_SIZE)
 )
 
-const VERSION = "0.5.0"
+const VERSION = "0.5.1"
 
 const (
 	QUEUE_LIMIT    = 10000
@@ -176,11 +176,11 @@ func fmtTime(seconds int) string {
 	return fmt.Sprintf("%dh%02dm", seconds/3600, (seconds%3600)/60)
 }
 
-// Get physical offset of first extent via FIEMAP ioctl
-func getFirstExtentPhys(path string) (uint64, error) {
+// Get physical offset and length of first extent via FIEMAP ioctl
+func getFirstExtentPhys(path string) (uint64, uint64, error) {
 	fd, err := syscall.Open(path, syscall.O_RDONLY, 0)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	defer syscall.Close(fd)
 
@@ -192,16 +192,17 @@ func getFirstExtentPhys(path string) (uint64, error) {
 	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd),
 		IOC_FIEMAP, uintptr(unsafe.Pointer(&buf[0])))
 	if errno != 0 {
-		return 0, errno
+		return 0, 0, errno
 	}
 
 	mapped := binary.LittleEndian.Uint32(buf[20:24])
 	if mapped == 0 {
-		return 0, fmt.Errorf("no extents")
+		return 0, 0, fmt.Errorf("no extents")
 	}
 
 	phys := binary.LittleEndian.Uint64(buf[FIEMAP_HEADER_SIZE+8 : FIEMAP_HEADER_SIZE+16])
-	return phys, nil
+	length := binary.LittleEndian.Uint64(buf[FIEMAP_HEADER_SIZE+16 : FIEMAP_HEADER_SIZE+24])
+	return phys, length, nil
 }
 
 func getFileSize(path string) (int64, error) {
@@ -308,14 +309,14 @@ func logicalResolve(mountFd int, mount string, physAddr uint64, subvolCache map[
 
 // dedupGroup represents a set of identical files to deduplicate
 type dedupGroup struct {
-	paths            []string // first path is src, rest are dests
-	numUniqueExtents int      // for correct saved calculation
+	paths          []string // first path is src, rest are dests
+	estimatedSaved int64    // sum of unique extent sizes (physical, from FIEMAP)
 }
 
 // fideduperange calls the FIDEDUPERANGE ioctl: dedup src into multiple dests.
-// numUniqueExtents is used for saved calculation (unique old extents freed × file size).
-// Returns (number of successfully deduped dests, total bytes saved).
-func fideduperange(srcPath string, dstPaths []string, numUniqueExtents int) (int, int64, error) {
+// estimatedSaved is pre-calculated from sum of unique extent physical sizes.
+// Returns (number of successfully deduped dests, estimated bytes saved).
+func fideduperange(srcPath string, dstPaths []string, estimatedSaved int64) (int, int64, error) {
 	srcFd, err := syscall.Open(srcPath, syscall.O_RDONLY, 0)
 	if err != nil {
 		return 0, 0, fmt.Errorf("open src %s: %w", srcPath, err)
@@ -330,9 +331,6 @@ func fideduperange(srcPath string, dstPaths []string, numUniqueExtents int) (int
 	if len(dstPaths) == 0 {
 		return 0, 0, nil
 	}
-
-	// Actual space saved = unique old extents freed × file size
-	savedBytes := int64(numUniqueExtents) * srcSize
 
 	deduped := 0
 	// Batch by: max 120 dests (page limit) AND max ~2GiB total data per batch.
@@ -397,10 +395,10 @@ func fideduperange(srcPath string, dstPaths []string, numUniqueExtents int) (int
 			}
 		}
 		if errno != 0 {
-			return deduped, savedBytes, errno
+			return deduped, estimatedSaved, errno
 		}
 	}
-	return deduped, savedBytes, nil
+	return deduped, estimatedSaved, nil
 }
 
 type snapshotInfo struct {
@@ -1159,7 +1157,7 @@ func main() {
 				src := group.paths[0]
 				dsts := group.paths[1:]
 
-				n, savedBytes, err := fideduperange(src, dsts, group.numUniqueExtents)
+				n, savedBytes, err := fideduperange(src, dsts, group.estimatedSaved)
 				if err != nil && n == 0 {
 					fmt.Fprintf(logFile, "dedup error: %s: %v\n", src, err)
 				}
@@ -1218,8 +1216,8 @@ func main() {
 		}
 
 		// Step 3: FIEMAP check
-		physLive, err1 := getFirstExtentPhys(file)
-		physSnap, err2 := getFirstExtentPhys(snap)
+		physLive, _, err1 := getFirstExtentPhys(file)
+		physSnap, _, err2 := getFirstExtentPhys(snap)
 		if err1 == nil && err2 == nil && physLive == physSnap {
 			cnt.shared++
 			return
@@ -1230,13 +1228,13 @@ func main() {
 
 		// Step 4: Walk all snapshots OF THIS SUBVOL, collect extents
 		group := map[string]bool{file: true}
-		uniqueExtents := make(map[uint64]bool) // physical offsets != live extent
+		uniqueExtentSizes := make(map[uint64]int64) // phys offset → physical extent size
 		for _, s := range snaps {
 			sf := s.absPath + "/" + subRel
 			if !fileExists(sf) {
 				continue
 			}
-			phys, err := getFirstExtentPhys(sf)
+			phys, physLen, err := getFirstExtentPhys(sf)
 			if err != nil {
 				group[sf] = true // can't check, include anyway
 				continue
@@ -1246,12 +1244,12 @@ func main() {
 			}
 			group[sf] = true
 			if phys > 0 {
-				uniqueExtents[phys] = true
+				uniqueExtentSizes[phys] = int64(physLen)
 			}
 		}
 
 		// Step 5: For each unique extent, LOGICAL_INO to find all other refs
-		for phys := range uniqueExtents {
+		for phys := range uniqueExtentSizes {
 			for _, p := range logicalResolve(mountFd, mount, phys, subvolCache) {
 				group[p] = true
 			}
@@ -1273,7 +1271,12 @@ func main() {
 
 		// Send to dedup worker pool
 		cnt.pending.Add(1)
-		dedupCh <- dedupGroup{paths: paths, numUniqueExtents: len(uniqueExtents)}
+		// Sum physical sizes of unique extents for accurate saved calculation
+		var estSaved int64
+		for _, physLen := range uniqueExtentSizes {
+			estSaved += physLen
+		}
+		dedupCh <- dedupGroup{paths: paths, estimatedSaved: estSaved}
 	}
 
 	// Consumer: read from SpillQueue
