@@ -8,7 +8,7 @@ This tool re-consolidates snapshot extents with the live file. Fast, metadata-on
 
 - **Defragmentation** — `btrfs filesystem defragment` rewrites extents, snapshots keep the old ones
 - **Post-compression** — `btrfs filesystem defragment -czstd` creates new compressed extents, snapshots still reference the old uncompressed data
-- **bees dedup daemon** — deduplicates live files but does not consolidate snapshot copies ([Zygo/bees#342](https://github.com/Zygo/bees/pull/342))
+- **old bees dedup daemon** — Deduplicated live files but did not consolidate snapshot copies. This is fixed since version v0.11.
 
 ## How It Works
 
