@@ -48,7 +48,7 @@ var (
 	DEDUPE_RANGE_INFO_SIZE = int(C.DEDUPE_RANGE_INFO_SIZE)
 )
 
-const VERSION = "0.5.1"
+const VERSION = "0.6.0"
 
 const (
 	QUEUE_LIMIT    = 10000
@@ -311,6 +311,7 @@ func logicalResolve(mountFd int, mount string, physAddr uint64, subvolCache map[
 type dedupGroup struct {
 	paths          []string // first path is src, rest are dests
 	estimatedSaved int64    // sum of unique extent sizes (physical, from FIEMAP)
+	numCopies      int      // total copies in this group (len(paths))
 }
 
 // fideduperange calls the FIDEDUPERANGE ioctl: dedup src into multiple dests.
@@ -773,15 +774,19 @@ func getSubvolID(path string) (uint64, error) {
 }
 
 type counters struct {
-	checked    int
-	candidates int
-	copies     int
-	notFound   int
-	changed    int
-	shared     int
-	deduped    atomic.Int64
-	pending    atomic.Int64
-	bytesSaved atomic.Int64
+	checked       int
+	candidates    int
+	copies        int
+	notFound      int
+	changed       int
+	shared        int
+	deduped       atomic.Int64
+	dedupedCopies atomic.Int64
+	pending       atomic.Int64
+	pendingCopies atomic.Int64
+	pendingSaved  atomic.Int64
+	activeWorkers atomic.Int64
+	bytesSaved    atomic.Int64
 }
 
 func printUsage() {
@@ -972,10 +977,8 @@ func main() {
 	fmt.Fprintln(os.Stderr, "  shared     = already shares extents with snapshot (skipped)")
 	fmt.Fprintln(os.Stderr, "  not_found  = file not found in any snapshot (skipped)")
 	fmt.Fprintln(os.Stderr, "  changed    = file size differs from snapshot (skipped)")
-	fmt.Fprintln(os.Stderr, "  candidates = possible duplicates / total identical copies for dedup")
-	fmt.Fprintln(os.Stderr, "  pending    = groups waiting for dedup worker")
-	fmt.Fprintln(os.Stderr, "  deduped    = groups successfully deduplicated via FIDEDUPERANGE")
-	fmt.Fprintln(os.Stderr, "  saved      = bytes saved by dedup (bytes_deduped from ioctl)")
+	fmt.Fprintln(os.Stderr, "  pending    = groups/copies/expectedSavings(activeWorkers) waiting for dedup")
+	fmt.Fprintln(os.Stderr, "  deduped    = groups/copies/saved — successfully deduplicated via FIDEDUPERANGE")
 	fmt.Fprintln(os.Stderr, "══════════════════════════════════════════════════════════════════════════════")
 
 	// Binary search: find oldest snapshot containing a file
@@ -1092,19 +1095,23 @@ func main() {
 				}
 			}
 			buf := fileQ.Buffered()
-			saved := cnt.bytesSaved.Load()
-			savedStr := fmt.Sprintf("%dB", saved)
-			if saved >= 1024*1024*1024 {
-				savedStr = fmt.Sprintf("%.1fG", float64(saved)/(1024*1024*1024))
-			} else if saved >= 1024*1024 {
-				savedStr = fmt.Sprintf("%.1fM", float64(saved)/(1024*1024))
-			} else if saved >= 1024 {
-				savedStr = fmt.Sprintf("%.1fK", float64(saved)/1024)
+			fmtBytes := func(b int64) string {
+				if b >= 1024*1024*1024 {
+					return fmt.Sprintf("%.1fG", float64(b)/(1024*1024*1024))
+				} else if b >= 1024*1024 {
+					return fmt.Sprintf("%.1fM", float64(b)/(1024*1024))
+				} else if b >= 1024 {
+					return fmt.Sprintf("%.1fK", float64(b)/1024)
+				}
+				return fmt.Sprintf("%dB", b)
 			}
-			fmt.Fprintf(os.Stderr, "  [%s] found=%d buf=%d checked=%s shared=%d not_found=%d changed=%d candidates=%d/%d pending=%d deduped=%d saved=%s%s\n",
+			saved := cnt.bytesSaved.Load()
+			pendingSaved := cnt.pendingSaved.Load()
+			fmt.Fprintf(os.Stderr, "  [%s] found=%d buf=%d checked=%s shared=%d not_found=%d changed=%d pending=%d/%d/%s(%d) deduped=%d/%d/%s%s\n",
 				fmtTime(elapsed), totalFound, buf, checkedStr, cnt.shared,
-				cnt.notFound, cnt.changed, cnt.candidates, cnt.copies,
-				cnt.pending.Load(), cnt.deduped.Load(), savedStr, etaStr)
+				cnt.notFound, cnt.changed,
+				cnt.pending.Load(), cnt.pendingCopies.Load(), fmtBytes(pendingSaved), cnt.activeWorkers.Load(),
+				cnt.deduped.Load(), cnt.dedupedCopies.Load(), fmtBytes(saved), etaStr)
 
 			select {
 			case <-statusDone:
@@ -1146,7 +1153,7 @@ func main() {
 	}
 
 	// Dedup worker pool
-	dedupCh := make(chan dedupGroup, 100)
+	dedupCh := make(chan dedupGroup, 10000)
 	var dedupWg sync.WaitGroup
 
 	for i := 0; i < *workers; i++ {
@@ -1154,6 +1161,7 @@ func main() {
 		go func() {
 			defer dedupWg.Done()
 			for group := range dedupCh {
+				cnt.activeWorkers.Add(1)
 				src := group.paths[0]
 				dsts := group.paths[1:]
 
@@ -1166,7 +1174,11 @@ func main() {
 					writeDoneGroup(group.paths)
 				}
 				cnt.deduped.Add(1)
+				cnt.dedupedCopies.Add(int64(group.numCopies))
 				cnt.pending.Add(-1)
+				cnt.pendingCopies.Add(-int64(group.numCopies))
+				cnt.pendingSaved.Add(-group.estimatedSaved)
+				cnt.activeWorkers.Add(-1)
 			}
 		}()
 	}
@@ -1271,12 +1283,14 @@ func main() {
 
 		// Send to dedup worker pool
 		cnt.pending.Add(1)
+		cnt.pendingCopies.Add(int64(len(paths)))
 		// Sum physical sizes of unique extents for accurate saved calculation
 		var estSaved int64
 		for _, physLen := range uniqueExtentSizes {
 			estSaved += physLen
 		}
-		dedupCh <- dedupGroup{paths: paths, estimatedSaved: estSaved}
+		cnt.pendingSaved.Add(estSaved)
+		dedupCh <- dedupGroup{paths: paths, estimatedSaved: estSaved, numCopies: len(paths)}
 	}
 
 	// Consumer: read from SpillQueue
@@ -1328,8 +1342,8 @@ done:
 	fmt.Fprintf(os.Stderr, "  Skip not_found: %d\n", cnt.notFound)
 	fmt.Fprintf(os.Stderr, "  Skip changed:   %d\n", cnt.changed)
 	fmt.Fprintf(os.Stderr, "  Skip shared:    %d\n", cnt.shared)
-	fmt.Fprintf(os.Stderr, "  Deduped:        %d\n", cnt.deduped.Load())
-	fmt.Fprintf(os.Stderr, "  Pending:        %d\n", cnt.pending.Load())
+	fmt.Fprintf(os.Stderr, "  Deduped:        %d (%d copies)\n", cnt.deduped.Load(), cnt.dedupedCopies.Load())
+	fmt.Fprintf(os.Stderr, "  Pending:        %d (%d copies)\n", cnt.pending.Load(), cnt.pendingCopies.Load())
 	fmt.Fprintf(os.Stderr, "  Saved:          %s\n", savedStr)
 	fmt.Fprintf(os.Stderr, "  Runtime:        %s\n", fmtTime(elapsed))
 	if interrupted.Load() && lastFile != "" {
