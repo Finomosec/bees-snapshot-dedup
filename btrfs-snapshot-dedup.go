@@ -48,11 +48,11 @@ var (
 	DEDUPE_RANGE_INFO_SIZE = int(C.DEDUPE_RANGE_INFO_SIZE)
 )
 
-const VERSION = "0.6.0"
+const VERSION = "0.6.1"
 
 const (
 	QUEUE_LIMIT    = 10000
-	DEDUP_WORKERS  = 2
+	DEDUP_WORKERS  = 1
 
 	SEARCH_KEY_SIZE    = C.sizeof_struct_btrfs_ioctl_search_key
 	SEARCH_HEADER_SIZE = 32 // btrfs_ioctl_search_header is not in uapi, always 32
