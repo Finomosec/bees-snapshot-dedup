@@ -48,7 +48,7 @@ var (
 	DEDUPE_RANGE_INFO_SIZE = int(C.DEDUPE_RANGE_INFO_SIZE)
 )
 
-const VERSION = "0.7.0"
+const VERSION = "0.7.1"
 
 const (
 	QUEUE_LIMIT    = 10000
@@ -1171,6 +1171,36 @@ func main() {
 		doneMu.Unlock()
 	}
 
+	// In-flight tracker: tracks oldest pending dedup path for correct resume point
+	var inflightMu sync.Mutex
+	var inflightQueue []string // ordered by scan order (append-only, remove from front)
+
+	inflightAdd := func(path string) {
+		inflightMu.Lock()
+		inflightQueue = append(inflightQueue, path)
+		inflightMu.Unlock()
+	}
+
+	inflightRemove := func(path string) {
+		inflightMu.Lock()
+		for i, p := range inflightQueue {
+			if p == path {
+				inflightQueue = append(inflightQueue[:i], inflightQueue[i+1:]...)
+				break
+			}
+		}
+		inflightMu.Unlock()
+	}
+
+	inflightOldest := func() string {
+		inflightMu.Lock()
+		defer inflightMu.Unlock()
+		if len(inflightQueue) > 0 {
+			return inflightQueue[0]
+		}
+		return ""
+	}
+
 	// Dedup worker pool with per-category concurrency limits
 	// Category 0 (<10MB): unlimited (limited only by worker count)
 	// Category 1-3 (>=10MB): max 1 concurrent each
@@ -1214,6 +1244,7 @@ func main() {
 				cnt.pendingCopies.Add(-int64(group.numCopies))
 				cnt.pendingSaved.Add(-group.estimatedSaved)
 				cnt.activeWorkers.Add(-1)
+				inflightRemove(strings.TrimPrefix(src, live+"/"))
 
 				// Release semaphore
 				if cat > 0 {
@@ -1330,6 +1361,7 @@ func main() {
 			estSaved += physLen
 		}
 		cnt.pendingSaved.Add(estSaved)
+		inflightAdd(strings.TrimPrefix(file, live+"/"))
 		dedupCh <- dedupGroup{paths: paths, estimatedSaved: estSaved, numCopies: len(paths), fileSize: sizeLive}
 	}
 
@@ -1386,8 +1418,14 @@ done:
 	fmt.Fprintf(os.Stderr, "  Pending:        %d (%d copies)\n", cnt.pending.Load(), cnt.pendingCopies.Load())
 	fmt.Fprintf(os.Stderr, "  Saved:          %s\n", savedStr)
 	fmt.Fprintf(os.Stderr, "  Runtime:        %s\n", fmtTime(elapsed))
-	if interrupted.Load() && lastFile != "" {
-		fmt.Fprintf(os.Stderr, "\n  Resume with: --start-at='%s'\n", lastFile)
-		fmt.Fprintf(os.Stderr, "  Unprocessed candidates in candidates.fdupes, done in candidates.done\n")
+	if interrupted.Load() {
+		resumePoint := inflightOldest()
+		if resumePoint == "" {
+			resumePoint = lastFile
+		}
+		if resumePoint != "" {
+			fmt.Fprintf(os.Stderr, "\n  Resume with: -start-at='%s'\n", resumePoint)
+			fmt.Fprintf(os.Stderr, "  Unprocessed candidates in candidates.fdupes, done in candidates.done\n")
+		}
 	}
 }
