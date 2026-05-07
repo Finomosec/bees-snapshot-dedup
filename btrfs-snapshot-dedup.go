@@ -48,7 +48,7 @@ var (
 	DEDUPE_RANGE_INFO_SIZE = int(C.DEDUPE_RANGE_INFO_SIZE)
 )
 
-const VERSION = "0.9.0"
+const VERSION = "0.9.1"
 
 const (
 	QUEUE_LIMIT    = 10000
@@ -255,6 +255,17 @@ func getExtentInfo(path string) (extentInfo, error) {
 	}, nil
 }
 
+func fmtBytesStatic(b int64) string {
+	if b >= 1024*1024*1024 {
+		return fmt.Sprintf("%.1fG", float64(b)/(1024*1024*1024))
+	} else if b >= 1024*1024 {
+		return fmt.Sprintf("%.1fM", float64(b)/(1024*1024))
+	} else if b >= 1024 {
+		return fmt.Sprintf("%.1fK", float64(b)/1024)
+	}
+	return fmt.Sprintf("%dB", b)
+}
+
 func getFileSize(path string) (int64, error) {
 	var st syscall.Stat_t
 	err := syscall.Stat(path, &st)
@@ -387,8 +398,15 @@ func sizeCategory(size int64) int {
 // fideduperange calls the FIDEDUPERANGE ioctl: dedup src into multiple dests.
 // estimatedSaved is pre-calculated from sum of unique extent physical sizes.
 // Returns (number of successfully deduped dests, estimated bytes saved).
-func fideduperange(srcPath string, dstPaths []string, estimatedSaved int64) (int, int64, error) {
+// debugTimedFn is a function type for debug timing. nil = no debug.
+type debugTimedFn func(start time.Time, format string, args ...interface{}) time.Duration
+
+func fideduperange(srcPath string, dstPaths []string, estimatedSaved int64, dbg debugTimedFn) (int, int64, error) {
+	t := time.Now()
 	srcFd, err := syscall.Open(srcPath, syscall.O_RDONLY, 0)
+	if dbg != nil {
+		dbg(t, "open src %s", srcPath)
+	}
 	if err != nil {
 		return 0, 0, fmt.Errorf("open src %s: %w", srcPath, err)
 	}
@@ -435,9 +453,14 @@ func fideduperange(srcPath string, dstPaths []string, estimatedSaved int64) (int
 		le.PutUint16(buf[16:18], uint16(len(batch)))      // dest_count
 
 		// Open dest fds (O_RDONLY — works on read-only snapshots)
+		t = time.Now()
 		dstFds := make([]int, len(batch))
 		for j, dstPath := range batch {
+			tOpen := time.Now()
 			fd, err := syscall.Open(dstPath, syscall.O_RDONLY, 0)
+			if dbg != nil {
+				dbg(tOpen, "open dst[%d] %s", j, dstPath)
+			}
 			if err != nil {
 				dstFds[j] = -1
 				continue
@@ -449,9 +472,16 @@ func fideduperange(srcPath string, dstPaths []string, estimatedSaved int64) (int
 			le.PutUint64(buf[off+16:off+24], 0)       // bytes_deduped (out)
 			le.PutUint32(buf[off+24:off+28], 0)       // status (out)
 		}
+		if dbg != nil {
+			dbg(t, "open %d dests (batch %d/%d)", len(batch), i/maxDestsPerBatch+1, (len(dstPaths)+maxDestsPerBatch-1)/maxDestsPerBatch)
+		}
 
+		t = time.Now()
 		_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(srcFd),
 			IOC_FIDEDUPERANGE, uintptr(unsafe.Pointer(&buf[0])))
+		if dbg != nil {
+			dbg(t, "ioctl FIDEDUPERANGE batch %d dests, srcSize=%d", len(batch), srcSize)
+		}
 
 		// Count successes and close fds
 		for j := range batch {
@@ -887,8 +917,42 @@ func printUsage() {
 func main() {
 	workers := flag.Int("workers", DEDUP_WORKERS, "number of parallel dedup workers")
 	startAt := flag.String("start-at", "", "resume: skip files until this relative path (lexicographic)")
+	debugMs := flag.Int("debug", 0, "enable debug log: log actions taking >= N ms (e.g. --debug=100)")
 	flag.Usage = printUsage
 	flag.Parse()
+
+	// Debug logger: writes to debug.log, only actions >= debugMs
+	var debugLog func(format string, args ...interface{})
+	var debugFile *os.File
+	if *debugMs > 0 {
+		var err error
+		debugFile, err = os.OpenFile("debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "WARNING: could not open debug.log: %v\n", err)
+			debugLog = func(format string, args ...interface{}) {} // noop
+		} else {
+			debugThreshold := time.Duration(*debugMs) * time.Millisecond
+			_ = debugThreshold // used in debugTimed
+			debugLog = func(format string, args ...interface{}) {
+				fmt.Fprintf(debugFile, "[%s] %s\n", time.Now().Format("15:04:05.000"), fmt.Sprintf(format, args...))
+			}
+			defer debugFile.Close()
+			debugLog("debug started: threshold=%dms workers=%d", *debugMs, *workers)
+		}
+	} else {
+		debugLog = func(format string, args ...interface{}) {} // noop
+	}
+	debugThresholdMs := int64(*debugMs)
+
+	// debugTimed logs if elapsed >= threshold. Returns elapsed for chaining.
+	debugTimed := func(start time.Time, format string, args ...interface{}) time.Duration {
+		elapsed := time.Since(start)
+		if debugThresholdMs > 0 && elapsed.Milliseconds() >= debugThresholdMs {
+			msg := fmt.Sprintf(format, args...)
+			debugLog("%s took %s", msg, elapsed.Round(time.Millisecond))
+		}
+		return elapsed
+	}
 
 	// First two positional args are mount + subvol, rest goes to find(1)
 	args := flag.Args()
@@ -1220,6 +1284,7 @@ func main() {
 	var doneMu sync.Mutex   // protects doneFile writes
 
 	writeFdupesGroup := func(paths []string) {
+		t := time.Now()
 		fdupesMu.Lock()
 		for _, p := range paths {
 			fmt.Fprintln(fdupesFile, p)
@@ -1227,9 +1292,11 @@ func main() {
 		fmt.Fprintln(fdupesFile)
 		fdupesFile.Sync()
 		fdupesMu.Unlock()
+		debugTimed(t, "writeFdupes %d paths", len(paths))
 	}
 
 	writeDoneGroup := func(paths []string) {
+		t := time.Now()
 		doneMu.Lock()
 		for _, p := range paths {
 			fmt.Fprintln(doneFile, p)
@@ -1237,6 +1304,7 @@ func main() {
 		fmt.Fprintln(doneFile)
 		doneFile.Sync()
 		doneMu.Unlock()
+		debugTimed(t, "writeDone %d paths", len(paths))
 	}
 
 	// In-flight tracker: tracks oldest pending dedup path for correct resume point
@@ -1250,6 +1318,7 @@ func main() {
 	}
 
 	inflightRemove := func(path string) {
+		t := time.Now()
 		inflightMu.Lock()
 		for i, p := range inflightQueue {
 			if p == path {
@@ -1257,7 +1326,9 @@ func main() {
 				break
 			}
 		}
+		n := len(inflightQueue)
 		inflightMu.Unlock()
+		debugTimed(t, "inflightRemove (queue=%d)", n)
 	}
 
 	inflightOldest := func() string {
@@ -1301,13 +1372,19 @@ func main() {
 
 	// Worker function
 	doDedup := func(group dedupGroup) {
+		dedupStart := time.Now()
 		cnt.activeMu.Lock()
 		cnt.activeSizes = append(cnt.activeSizes, group.fileSize)
 		cnt.activeMu.Unlock()
 		src := group.paths[0]
 		dsts := group.paths[1:]
 
-		n, savedBytes, err := fideduperange(src, dsts, group.estimatedSaved)
+		var dbg debugTimedFn
+		if debugThresholdMs > 0 {
+			dbg = debugTimed
+		}
+		n, savedBytes, err := fideduperange(src, dsts, group.estimatedSaved, dbg)
+		debugTimed(dedupStart, "fideduperange %s (%d dests, %s)", src, len(dsts), fmtBytesStatic(group.fileSize))
 		if err != nil && n == 0 {
 			fmt.Fprintf(logFile, "dedup error: %s: %v\n", src, err)
 		}
@@ -1464,8 +1541,12 @@ func main() {
 		}
 
 		// Step 3: FIEMAP check
+		t3 := time.Now()
 		physLive, _, err1 := getFirstExtentPhys(file)
+		debugTimed(t3, "fiemap live %s", file)
+		t3 = time.Now()
 		physSnap, _, err2 := getFirstExtentPhys(snap)
+		debugTimed(t3, "fiemap snap %s", snap)
 		if err1 == nil && err2 == nil && physLive == physSnap {
 			cnt.shared++
 			return
@@ -1475,6 +1556,7 @@ func main() {
 		cnt.candidates++
 
 		// Step 4: Walk all snapshots OF THIS SUBVOL, collect extents
+		t4 := time.Now()
 		group := map[string]bool{file: true}
 		uniqueExtentSizes := make(map[uint64]int64) // phys offset → physical extent size
 		for _, s := range snaps {
@@ -1495,13 +1577,19 @@ func main() {
 				uniqueExtentSizes[phys] = int64(physLen)
 			}
 		}
+		debugTimed(t4, "walk %d snapshots for %s (%d unique extents)", len(snaps), lastFile, len(uniqueExtentSizes))
 
 		// Step 5: For each unique extent, LOGICAL_INO to find all other refs
+		t5 := time.Now()
 		for phys := range uniqueExtentSizes {
-			for _, p := range logicalResolve(mountFd, mount, phys, subvolCache) {
+			tLR := time.Now()
+			resolved := logicalResolve(mountFd, mount, phys, subvolCache)
+			debugTimed(tLR, "logicalResolve phys=0x%x → %d refs", phys, len(resolved))
+			for _, p := range resolved {
 				group[p] = true
 			}
 		}
+		debugTimed(t5, "logicalResolve all %d extents for %s → %d total refs", len(uniqueExtentSizes), lastFile, len(group))
 
 		cnt.copies += len(group)
 
