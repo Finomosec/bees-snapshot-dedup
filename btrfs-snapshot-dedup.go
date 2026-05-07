@@ -957,7 +957,7 @@ func main() {
 		elapsed := time.Since(start)
 		if debugThresholdMs > 0 && elapsed.Milliseconds() >= debugThresholdMs {
 			msg := fmt.Sprintf(format, args...)
-			debugLog("%s took %s", msg, elapsed.Round(time.Millisecond))
+			fmt.Fprintf(debugFile, "%s [%s] %s\n", time.Now().Format("15:04:05.000"), elapsed.Round(time.Millisecond), msg)
 		}
 		return elapsed
 	}
