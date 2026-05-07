@@ -1238,7 +1238,7 @@ func main() {
 					etaStr = " done"
 				}
 			}
-			buf := fileQ.Buffered()
+			_ = fileQ.Buffered() // keep queue active
 			fmtBytes := func(b int64) string {
 				if b >= 1024*1024*1024 {
 					return fmt.Sprintf("%.1fG", float64(b)/(1024*1024*1024))
@@ -1265,8 +1265,8 @@ func main() {
 				activeStr = strings.Join(parts, ",")
 			}
 			cnt.activeMu.Unlock()
-			fmt.Fprintf(os.Stderr, "  [%s] found=%d buf=%d checked=%s/%d/%d/%d pending=%d/%d/%s(%s) deduped=%d/%d/%s skip=%d opt=%d/%d/%d/%d%s\n",
-				fmtTime(elapsed), totalFound, buf, checkedStr, cnt.shared, cnt.notFound, cnt.changed,
+			fmt.Fprintf(os.Stderr, "  [%s] found=%d checked=%s/%d/%d/%d pending=%d/%d/%s(%s) deduped=%d/%d/%s skip=%d opt=%d/%d/%d/%d%s\n",
+				fmtTime(elapsed), totalFound, checkedStr, cnt.shared, cnt.notFound, cnt.changed,
 				cnt.pending.Load(), cnt.pendingCopies.Load(), fmtBytes(pendingSaved), activeStr,
 				cnt.deduped.Load(), cnt.dedupedCopies.Load(), fmtBytes(saved),
 				cnt.probeSkipped.Load(),
