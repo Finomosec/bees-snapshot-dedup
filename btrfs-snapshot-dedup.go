@@ -48,7 +48,7 @@ var (
 	DEDUPE_RANGE_INFO_SIZE = int(C.DEDUPE_RANGE_INFO_SIZE)
 )
 
-const VERSION = "0.8.1"
+const VERSION = "0.9.0"
 
 const (
 	QUEUE_LIMIT    = 10000
@@ -61,6 +61,8 @@ const (
 
 	FIEMAP_HEADER_SIZE = C.sizeof_struct_fiemap
 	FIEMAP_EXTENT_SIZE = C.sizeof_struct_fiemap_extent
+
+	FIEMAP_EXTENT_ENCODED = 0x00000008 // compressed/encoded extent
 )
 
 // SpillQueue: in-memory queue that spills to a temp file when full.
@@ -203,6 +205,54 @@ func getFirstExtentPhys(path string) (uint64, uint64, error) {
 	phys := binary.LittleEndian.Uint64(buf[FIEMAP_HEADER_SIZE+8 : FIEMAP_HEADER_SIZE+16])
 	length := binary.LittleEndian.Uint64(buf[FIEMAP_HEADER_SIZE+16 : FIEMAP_HEADER_SIZE+24])
 	return phys, length, nil
+}
+
+// extentInfo holds metadata about a file's extents for source selection
+type extentInfo struct {
+	phys       uint64
+	physLen    uint64
+	compressed bool
+	numExtents int
+}
+
+// getExtentInfo returns physical offset, compressed flag, and extent count.
+// Uses a single FIEMAP call with room for up to 256 extents.
+func getExtentInfo(path string) (extentInfo, error) {
+	fd, err := syscall.Open(path, syscall.O_RDONLY, 0)
+	if err != nil {
+		return extentInfo{}, err
+	}
+	defer syscall.Close(fd)
+
+	const maxExtents = 256
+	buf := make([]byte, FIEMAP_HEADER_SIZE+FIEMAP_EXTENT_SIZE*maxExtents)
+	binary.LittleEndian.PutUint64(buf[0:8], 0)              // fm_start
+	binary.LittleEndian.PutUint64(buf[8:16], ^uint64(0))     // fm_length
+	binary.LittleEndian.PutUint32(buf[24:28], maxExtents)    // fm_extent_count
+
+	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd),
+		IOC_FIEMAP, uintptr(unsafe.Pointer(&buf[0])))
+	if errno != 0 {
+		return extentInfo{}, errno
+	}
+
+	mapped := binary.LittleEndian.Uint32(buf[20:24])
+	if mapped == 0 {
+		return extentInfo{}, fmt.Errorf("no extents")
+	}
+
+	// First extent: phys offset, length, flags
+	phys := binary.LittleEndian.Uint64(buf[FIEMAP_HEADER_SIZE+8 : FIEMAP_HEADER_SIZE+16])
+	physLen := binary.LittleEndian.Uint64(buf[FIEMAP_HEADER_SIZE+16 : FIEMAP_HEADER_SIZE+24])
+	flags := binary.LittleEndian.Uint32(buf[FIEMAP_HEADER_SIZE+40 : FIEMAP_HEADER_SIZE+44])
+	compressed := flags&FIEMAP_EXTENT_ENCODED != 0
+
+	return extentInfo{
+		phys:       phys,
+		physLen:    physLen,
+		compressed: compressed,
+		numExtents: int(mapped),
+	}, nil
 }
 
 func getFileSize(path string) (int64, error) {
@@ -1455,11 +1505,71 @@ func main() {
 
 		cnt.copies += len(group)
 
-		// Build path list (src = live file first)
+		// Smart source selection:
+		// 1. Compressed > uncompressed (preserve compression work)
+		// 2. Fewer extents > more extents (preserve defrag work, threshold: 2x)
+		// 3. More refs > fewer refs (less rewrite work, tiebreaker)
+		//
+		// Compare live extent vs the most common snapshot extent.
+		bestSrc := file
+		liveInfo, liveErr := getExtentInfo(file)
+
+		if liveErr == nil && len(uniqueExtentSizes) > 0 {
+			// Find a representative file for the largest snapshot extent group
+			var snapRepresentative string
+			for _, s := range snaps {
+				sf := s.absPath + "/" + subRel
+				if group[sf] && sf != file {
+					snapRepresentative = sf
+					break
+				}
+			}
+			if snapRepresentative != "" {
+				snapInfo, snapErr := getExtentInfo(snapRepresentative)
+				if snapErr == nil {
+					// Ref count: group total minus live-side refs
+					// All paths sharing physLive are live-side, rest are snap-side
+					snapRefs := len(group) - 1 // approximation: most group members are snap-side
+					liveRefs := 1              // live file itself
+
+					// Decision: prefer snapshot extent as source?
+					preferSnap := false
+
+					if snapInfo.compressed && !liveInfo.compressed {
+						preferSnap = true // snap is compressed, live is not
+					} else if !snapInfo.compressed && liveInfo.compressed {
+						preferSnap = false // live is compressed, keep it
+					} else {
+						// Both same compression state — check fragmentation
+						// Prefer less fragmented, but only if difference is significant (2x threshold)
+						if snapInfo.numExtents > 0 && liveInfo.numExtents > 0 {
+							if liveInfo.numExtents > snapInfo.numExtents*2 {
+								preferSnap = true // live is much more fragmented
+							} else if snapInfo.numExtents > liveInfo.numExtents*2 {
+								preferSnap = false // snap is much more fragmented
+							} else {
+								// Similar fragmentation — prefer more refs (less rewrite)
+								if snapRefs > liveRefs {
+									preferSnap = true
+								}
+							}
+						} else if snapRefs > liveRefs {
+							preferSnap = true // fallback: more refs wins
+						}
+					}
+
+					if preferSnap {
+						bestSrc = snapRepresentative
+					}
+				}
+			}
+		}
+
+		// Build path list (bestSrc first)
 		paths := make([]string, 0, len(group))
-		paths = append(paths, file)
+		paths = append(paths, bestSrc)
 		for p := range group {
-			if p != file {
+			if p != bestSrc {
 				paths = append(paths, p)
 			}
 		}
