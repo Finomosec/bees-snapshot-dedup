@@ -894,7 +894,7 @@ type counters struct {
 	// Source selection optimization counters
 	optCompressed    int // source chosen because compressed
 	optLessFragmented int // source chosen because less fragmented
-	optMoreRefs      int // source chosen because more refs (tiebreaker)
+	optLessRewrites      int // source chosen because more refs (tiebreaker)
 	optDefault       int // default (live file as source)
 
 	probeSkipped atomic.Int64 // groups skipped because probe dedup had 0 gain
@@ -1122,7 +1122,7 @@ func main() {
 	fmt.Fprintln(os.Stderr, "  pending    = groups/copies/expectedSavings(active dedup sizes) waiting for dedup")
 	fmt.Fprintln(os.Stderr, "  deduped    = groups/copies/saved")
 	fmt.Fprintln(os.Stderr, "  skip       = groups skipped (probe: already same extent, file >= 1MB)")
-	fmt.Fprintln(os.Stderr, "  opt        = compressed/lessFragmented/moreRefs/default (source selection)")
+	fmt.Fprintln(os.Stderr, "  opt        = compressed/lessFragmented/lessRewrites/default (source selection)")
 	fmt.Fprintln(os.Stderr, "══════════════════════════════════════════════════════════════════════════════")
 
 	// Binary search: find oldest snapshot containing a file
@@ -1270,7 +1270,7 @@ func main() {
 				cnt.pending.Load(), cnt.pendingCopies.Load(), fmtBytes(pendingSaved), activeStr,
 				cnt.deduped.Load(), cnt.dedupedCopies.Load(), fmtBytes(saved),
 				cnt.probeSkipped.Load(),
-				cnt.optCompressed, cnt.optLessFragmented, cnt.optMoreRefs, cnt.optDefault, etaStr)
+				cnt.optCompressed, cnt.optLessFragmented, cnt.optLessRewrites, cnt.optDefault, etaStr)
 
 			select {
 			case <-statusDone:
@@ -1688,12 +1688,12 @@ func main() {
 								// Similar fragmentation — prefer more refs (less rewrite)
 								if snapRefs > liveRefs {
 									preferSnap = true
-									optReason = "moreRefs"
+									optReason = "lessRewrites"
 								}
 							}
 						} else if snapRefs > liveRefs {
 							preferSnap = true
-							optReason = "moreRefs"
+							optReason = "lessRewrites"
 						}
 					}
 
@@ -1702,8 +1702,8 @@ func main() {
 						cnt.optCompressed++
 					case "lessFragmented":
 						cnt.optLessFragmented++
-					case "moreRefs":
-						cnt.optMoreRefs++
+					case "lessRewrites":
+						cnt.optLessRewrites++
 					default:
 						cnt.optDefault++
 					}
