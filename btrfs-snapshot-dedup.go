@@ -48,7 +48,7 @@ var (
 	DEDUPE_RANGE_INFO_SIZE = int(C.DEDUPE_RANGE_INFO_SIZE)
 )
 
-const VERSION = "0.10.0"
+const VERSION = "0.10.1"
 
 const (
 	QUEUE_LIMIT    = 10000
@@ -1393,29 +1393,22 @@ func main() {
 		}
 
 		// Probe optimization: for files >= 1MB with multiple dests,
-		// FIEMAP-check src vs dests. If ALL share the same phys extent → skip group.
-		// Only check until we find one that differs (then we know dedup is needed).
+		// FIDEDUPERANGE with just 1 dest first. If bytes_deduped==0 → content
+		// differs, skip entire group. If >0 → content identical, dedup rest.
 		const probeThreshold = 1024 * 1024 // 1MB
 		probeSkipped := false
 		if group.fileSize >= probeThreshold && len(dsts) > 1 {
 			probeStart := time.Now()
-			srcPhys, _, srcErr := getFirstExtentPhys(src)
-			if srcErr == nil {
-				allSame := true
-				for _, d := range dsts {
-					dPhys, _, dErr := getFirstExtentPhys(d)
-					if dErr != nil || dPhys != srcPhys {
-						allSame = false
-						break
-					}
-				}
-				if allSame {
-					cnt.probeSkipped.Add(1)
-					probeSkipped = true
-					debugTimed(probeStart, "probe skip: %s (%d dests, %s) — all same extent 0x%x", src, len(dsts), fmtBytesStatic(group.fileSize), srcPhys)
-				} else {
-					debugTimed(probeStart, "probe pass: %s (%d dests, %s) — has different extents", src, len(dsts), fmtBytesStatic(group.fileSize))
-				}
+			probeN, _, probeErr := fideduperange(src, dsts[:1], 0, dbg)
+			if probeErr == nil && probeN == 0 {
+				// Content differs — skip entire group
+				cnt.probeSkipped.Add(1)
+				probeSkipped = true
+				debugTimed(probeStart, "probe skip: %s (%d dests, %s) — content differs", src, len(dsts), fmtBytesStatic(group.fileSize))
+			} else if probeN > 0 {
+				// Content identical — first dest already deduped, do the rest
+				dsts = dsts[1:]
+				debugTimed(probeStart, "probe pass: %s (%d remaining dests, %s)", src, len(dsts), fmtBytesStatic(group.fileSize))
 			}
 		}
 
@@ -1430,8 +1423,10 @@ func main() {
 			}
 		}
 
-		if n > 0 || (group.fileSize >= probeThreshold && !probeSkipped) {
-			cnt.bytesSaved.Add(savedBytes)
+		if !probeSkipped {
+			if n > 0 {
+				cnt.bytesSaved.Add(savedBytes)
+			}
 			writeDoneGroup(group.paths)
 		}
 		cnt.deduped.Add(1)
