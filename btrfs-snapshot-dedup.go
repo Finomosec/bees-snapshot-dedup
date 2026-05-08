@@ -48,7 +48,7 @@ var (
 	DEDUPE_RANGE_INFO_SIZE = int(C.DEDUPE_RANGE_INFO_SIZE)
 )
 
-const VERSION = "1.3.0"
+const VERSION = "1.3.1"
 
 const (
 	QUEUE_LIMIT    = 10000
@@ -491,6 +491,20 @@ func fideduperange(srcPath string, dstPaths []string, fileSize int64, dbg debugT
 		dbg(t, "[%s] prefetch src %s", fmtBytesStatic(srcSize), srcPath)
 	}
 
+	// Background goroutine: re-read source periodically to keep it in page cache.
+	// Without this, source pages get evicted while processing many dests.
+	stopRefresh := make(chan struct{})
+	go func() {
+		for {
+			select {
+			case <-stopRefresh:
+				return
+			case <-time.After(5 * time.Second):
+				prefetchIntoCache(srcFd, srcSize)
+			}
+		}
+	}()
+
 	// Get phys addr for each dest and sort by it
 	type destEntry struct {
 		path string
@@ -554,6 +568,7 @@ func fideduperange(srcPath string, dstPaths []string, fileSize int64, dbg debugT
 		}
 	}
 
+	close(stopRefresh)
 	return totalDeduped, totalSaved, nil
 }
 
