@@ -48,7 +48,7 @@ var (
 	DEDUPE_RANGE_INFO_SIZE = int(C.DEDUPE_RANGE_INFO_SIZE)
 )
 
-const VERSION = "0.10.2"
+const VERSION = "0.10.3"
 
 const (
 	QUEUE_LIMIT    = 10000
@@ -1427,8 +1427,9 @@ func main() {
 		}
 
 		if !probeSkipped {
-			if n > 0 {
-				cnt.bytesSaved.Add(savedBytes)
+			totalSaved := savedBytes + probeSaved
+			if totalSaved > 0 {
+				cnt.bytesSaved.Add(totalSaved)
 			}
 			writeDoneGroup(group.paths)
 		}
