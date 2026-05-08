@@ -48,7 +48,7 @@ var (
 	DEDUPE_RANGE_INFO_SIZE = int(C.DEDUPE_RANGE_INFO_SIZE)
 )
 
-const VERSION = "1.4.0"
+const VERSION = "1.5.0"
 
 const (
 	QUEUE_LIMIT    = 10000
@@ -398,32 +398,13 @@ func sizeCategory(size int64) int {
 // debugTimedFn is a function type for debug timing. nil = no debug.
 type debugTimedFn func(start time.Time, format string, args ...interface{}) time.Duration
 
-// prefetchIntoCache reads the file into page cache via pread into a dummy buffer.
-// btrfs may ignore fadvise/readahead (low ioprio), so brute-force pread is needed.
-// If stop channel is provided and closed, aborts mid-read.
-func prefetchIntoCache(fd int, size int64, stop <-chan struct{}) {
-	const chunkSize = 128 * 1024 // 128KB per pread
-	dummy := make([]byte, chunkSize)
-	var off int64
-	for off < size {
-		if stop != nil {
-			select {
-			case <-stop:
-				return
-			default:
-			}
-		}
-		n := size - off
-		if n > chunkSize {
-			n = chunkSize
-		}
-		syscall.Pread(fd, dummy[:n], off)
-		off += n
-	}
-}
 
-// dedupSingle calls FIDEDUPERANGE for a single dest against an open src fd.
-// Returns (1 if deduped, bytes_deduped from kernel, error).
+const DEDUP_CHUNK_SIZE = 128 * 1024 * 1024 // 128 MB per chunked dedup call
+
+// dedupSingle deduplicates src against a single dest, using chunked I/O for large files.
+// For files <= DEDUP_CHUNK_SIZE: prefetch src+dst, single ioctl.
+// For larger files: prefetch and dedup in 128MB chunks to keep pages in cache.
+// Returns (1 if any bytes deduped, total bytes_deduped, error).
 func dedupSingle(srcFd int, srcSize int64, dstPath string, dbg debugTimedFn) (int, int64, error) {
 	t := time.Now()
 	dstFd, err := syscall.Open(dstPath, syscall.O_RDONLY, 0)
@@ -435,36 +416,71 @@ func dedupSingle(srcFd int, srcSize int64, dstPath string, dbg debugTimedFn) (in
 	}
 	defer syscall.Close(dstFd)
 
-	buf := make([]byte, DEDUPE_RANGE_SIZE+DEDUPE_RANGE_INFO_SIZE)
-	le := binary.LittleEndian
+	var totalBytesDeduped int64
 
-	le.PutUint64(buf[0:8], 0)                    // src_offset
-	le.PutUint64(buf[8:16], uint64(srcSize))      // src_length
-	le.PutUint16(buf[16:18], 1)                   // dest_count = 1
+	for chunkOff := int64(0); chunkOff < srcSize; chunkOff += DEDUP_CHUNK_SIZE {
+		chunkLen := srcSize - chunkOff
+		if chunkLen > DEDUP_CHUNK_SIZE {
+			chunkLen = DEDUP_CHUNK_SIZE
+		}
 
-	off := DEDUPE_RANGE_SIZE
-	le.PutUint64(buf[off:off+8], uint64(dstFd))   // dest_fd
-	le.PutUint64(buf[off+8:off+16], 0)             // dest_offset
-	le.PutUint64(buf[off+16:off+24], 0)            // bytes_deduped (out)
-	le.PutUint32(buf[off+24:off+28], 0)            // status (out)
+		// Prefetch this chunk of src + dst
+		prefetchRange(srcFd, chunkOff, chunkLen)
+		prefetchRange(dstFd, chunkOff, chunkLen)
 
-	t = time.Now()
-	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(srcFd),
-		IOC_FIDEDUPERANGE, uintptr(unsafe.Pointer(&buf[0])))
-	if dbg != nil {
-		dbg(t, "[%s] ioctl FIDEDUPERANGE dst=%s", fmtBytesStatic(srcSize), dstPath)
+		// FIDEDUPERANGE for this chunk
+		buf := make([]byte, DEDUPE_RANGE_SIZE+DEDUPE_RANGE_INFO_SIZE)
+		le := binary.LittleEndian
+
+		le.PutUint64(buf[0:8], uint64(chunkOff))     // src_offset
+		le.PutUint64(buf[8:16], uint64(chunkLen))     // src_length
+		le.PutUint16(buf[16:18], 1)                   // dest_count = 1
+
+		off := DEDUPE_RANGE_SIZE
+		le.PutUint64(buf[off:off+8], uint64(dstFd))   // dest_fd
+		le.PutUint64(buf[off+8:off+16], uint64(chunkOff)) // dest_offset
+		le.PutUint64(buf[off+16:off+24], 0)            // bytes_deduped (out)
+		le.PutUint32(buf[off+24:off+28], 0)            // status (out)
+
+		tIoctl := time.Now()
+		_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(srcFd),
+			IOC_FIDEDUPERANGE, uintptr(unsafe.Pointer(&buf[0])))
+		if dbg != nil {
+			dbg(tIoctl, "[%s @%s] ioctl FIDEDUPERANGE dst=%s",
+				fmtBytesStatic(chunkLen), fmtBytesStatic(chunkOff), dstPath)
+		}
+
+		if errno != 0 {
+			return 0, 0, errno
+		}
+
+		status := int32(le.Uint32(buf[off+24 : off+28]))
+		bytesDeduped := int64(le.Uint64(buf[off+16 : off+24]))
+
+		if status != 0 || bytesDeduped == 0 {
+			// Content differs at this chunk — abort early (no partial dedup)
+			break
+		}
+		totalBytesDeduped += bytesDeduped
 	}
 
-	if errno != 0 {
-		return 0, 0, errno
-	}
-
-	status := int32(le.Uint32(buf[off+24 : off+28]))
-	bytesDeduped := int64(le.Uint64(buf[off+16 : off+24]))
-	if status == 0 && bytesDeduped > 0 {
-		return 1, bytesDeduped, nil
+	if totalBytesDeduped > 0 {
+		return 1, totalBytesDeduped, nil
 	}
 	return 0, 0, nil
+}
+
+// prefetchRange reads a range of a file into page cache via pread.
+func prefetchRange(fd int, offset, length int64) {
+	const readSize = 128 * 1024 // 128KB per pread
+	dummy := make([]byte, readSize)
+	for off := offset; off < offset+length; off += readSize {
+		n := offset + length - off
+		if n > readSize {
+			n = readSize
+		}
+		syscall.Pread(fd, dummy[:n], off)
+	}
 }
 
 // fideduperange deduplicates src against dsts using single-dest calls with readahead.
@@ -489,42 +505,6 @@ func fideduperange(srcPath string, dstPaths []string, fileSize int64, dbg debugT
 	if len(dstPaths) == 0 {
 		return 0, 0, nil
 	}
-
-	// Prefetch source into page cache before starting any dedup.
-	// Background goroutine then re-reads src + current dst every 5s to keep warm.
-	t = time.Now()
-	prefetchIntoCache(srcFd, srcSize, nil)
-	if dbg != nil {
-		dbg(t, "[%s] prefetch src %s", fmtBytesStatic(srcSize), srcPath)
-	}
-
-	stopRefresh := make(chan struct{})
-	var currentDstPath atomic.Value // stores string
-	go func() {
-		for {
-			select {
-			case <-stopRefresh:
-				return
-			case <-time.After(10 * time.Second):
-			}
-			t0 := time.Now()
-			prefetchIntoCache(srcFd, srcSize, stopRefresh)
-			if dbg != nil {
-				dbg(t0, "[%s] prefetch src (refresh) %s", fmtBytesStatic(srcSize), srcPath)
-			}
-			if dp, ok := currentDstPath.Load().(string); ok && dp != "" {
-				t1 := time.Now()
-				dfd, err := syscall.Open(dp, syscall.O_RDONLY, 0)
-				if err == nil {
-					prefetchIntoCache(dfd, srcSize, stopRefresh)
-					syscall.Close(dfd)
-					if dbg != nil {
-						dbg(t1, "[%s] prefetch dst (refresh) %s", fmtBytesStatic(srcSize), dp)
-					}
-				}
-			}
-		}
-	}()
 
 	// Get phys addr for each dest and sort by it
 	type destEntry struct {
@@ -552,18 +532,6 @@ func fideduperange(srcPath string, dstPaths []string, fileSize int64, dbg debugT
 			continue // content differs for this phys addr — skip
 		}
 
-		// Prefetch dest into page cache via pread (brute force)
-		tRA := time.Now()
-		dstFd, err := syscall.Open(d.path, syscall.O_RDONLY, 0)
-		if err == nil {
-			prefetchIntoCache(dstFd, srcSize, nil)
-			syscall.Close(dstFd)
-			if dbg != nil {
-				dbg(tRA, "[%s] prefetch dst %s", fmtBytesStatic(srcSize), d.path)
-			}
-		}
-
-		currentDstPath.Store(d.path)
 		n, bytesDeduped, err := dedupSingle(srcFd, srcSize, d.path, dbg)
 		if err != nil {
 			continue
@@ -590,7 +558,6 @@ func fideduperange(srcPath string, dstPaths []string, fileSize int64, dbg debugT
 		}
 	}
 
-	close(stopRefresh)
 	return totalDeduped, totalSaved, nil
 }
 
