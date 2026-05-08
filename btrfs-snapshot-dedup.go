@@ -48,7 +48,7 @@ var (
 	DEDUPE_RANGE_INFO_SIZE = int(C.DEDUPE_RANGE_INFO_SIZE)
 )
 
-const VERSION = "1.1.0"
+const VERSION = "1.2.0"
 
 const (
 	QUEUE_LIMIT    = 10000
@@ -380,18 +380,15 @@ type dedupGroup struct {
 // sizeCategory returns the concurrency category for a file size.
 // Category 0 (<10MB): unlimited concurrency
 // Category 1 (10-100MB): max 1 concurrent
-// Category 2 (100MB-1GB): max 1 concurrent
-// Category 3 (>1GB): max 1 concurrent
+// Category 2 (>=100MB): max 1 concurrent
 func sizeCategory(size int64) int {
 	switch {
 	case size < 10*1024*1024:
 		return 0
 	case size < 100*1024*1024:
 		return 1
-	case size < 1024*1024*1024:
-		return 2
 	default:
-		return 3
+		return 2
 	}
 }
 
@@ -428,7 +425,7 @@ func dedupSingle(srcFd int, srcSize int64, dstPath string, dbg debugTimedFn) (in
 	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(srcFd),
 		IOC_FIDEDUPERANGE, uintptr(unsafe.Pointer(&buf[0])))
 	if dbg != nil {
-		dbg(t, "ioctl FIDEDUPERANGE 1 dest, srcSize=%d, dst=%s", srcSize, dstPath)
+		dbg(t, "[%s] ioctl FIDEDUPERANGE dst=%s", fmtBytesStatic(srcSize), dstPath)
 	}
 
 	if errno != 0 {
@@ -1396,9 +1393,9 @@ func main() {
 	}
 
 	// Dedup worker pool with per-category concurrency limits
-	// 4 queues by size category, workers pick from large→small, fallback to cat0
+	// 3 queues by size category, workers pick from large→small, fallback to cat0
 	// Category 0 (<10MB): unlimited concurrency
-	// Category 1-3 (>=10MB): max 1 concurrent per category (semaphore)
+	// Category 1-2 (>=10MB): max 1 concurrent per category (semaphore)
 	dedupCh := make(chan dedupGroup, 10000)
 	var dedupWg sync.WaitGroup
 
@@ -1407,13 +1404,13 @@ func main() {
 		mu    sync.Mutex
 		items []dedupGroup
 	}
-	catQ := [4]*catQueue{{}, {}, {}, {}}
+	catQ := [3]*catQueue{{}, {}, {}}
 	for i := range catQ {
 		catQ[i] = &catQueue{}
 	}
 
-	// Semaphores for categories 1-3 (tryAcquire/release)
-	catSem := [3]atomic.Bool{} // false = free, true = held
+	// Semaphores for categories 1-2 (tryAcquire/release)
+	catSem := [2]atomic.Bool{} // false = free, true = held
 
 	// Notify channel: signaled when new items are enqueued
 	notify := make(chan struct{}, 1)
@@ -1440,7 +1437,7 @@ func main() {
 		}
 
 		n, savedBytes, err := fideduperange(src, dsts, group.fileSize, dbg)
-		debugTimed(dedupStart, "fideduperange %s (%d dests, %s)", src, len(dsts), fmtBytesStatic(group.fileSize))
+		debugTimed(dedupStart, "[%s, %d dests] fideduperange %s", fmtBytesStatic(group.fileSize), len(dsts), src)
 		if err != nil && n == 0 {
 			fmt.Fprintf(logFile, "dedup error: %s: %v\n", src, err)
 		}
@@ -1489,8 +1486,8 @@ func main() {
 			defer dedupWg.Done()
 			for {
 				var picked bool
-				// Try categories 3→1 (large first): only if semaphore free
-				for c := 3; c >= 1; c-- {
+				// Try categories 2→1 (large first): only if semaphore free
+				for c := 2; c >= 1; c-- {
 					if catSem[c-1].CompareAndSwap(false, true) {
 						if g, ok := tryPop(c); ok {
 							doDedup(g)
@@ -1516,7 +1513,7 @@ func main() {
 				if workersDone.Load() {
 					// Check once more before exiting
 					empty := true
-					for c := 0; c < 4; c++ {
+					for c := 0; c < 3; c++ {
 						catQ[c].mu.Lock()
 						if len(catQ[c].items) > 0 {
 							empty = false
