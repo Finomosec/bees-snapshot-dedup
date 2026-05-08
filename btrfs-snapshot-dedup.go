@@ -1000,6 +1000,7 @@ func main() {
 	workers := flag.Int("workers", DEDUP_WORKERS, "number of parallel dedup workers")
 	startAt := flag.String("start-at", "", "resume: skip files until this relative path (lexicographic)")
 	debugMs := flag.Int("debug", 0, "enable debug log: log actions taking >= N ms (e.g. --debug=100)")
+	writeCandidates := flag.Bool("write-candidates", false, "write candidates.fdupes and candidates.done files")
 	flag.Usage = printUsage
 	flag.Parse()
 
@@ -1355,18 +1356,26 @@ func main() {
 		}
 	}()
 
-	// Output files (append-only, fdupes format)
-	fdupesFile, _ := os.OpenFile("candidates.fdupes", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	defer fdupesFile.Close()
-	doneFile, _ := os.OpenFile("candidates.done", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	defer doneFile.Close()
+	// Output files
 	logFile, _ := os.OpenFile("bees-snapshot-dedup.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	defer logFile.Close()
+
+	// Optional candidate files (--write-candidates)
+	var fdupesFile, doneFile *os.File
+	if *writeCandidates {
+		fdupesFile, _ = os.OpenFile("candidates.fdupes", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		defer fdupesFile.Close()
+		doneFile, _ = os.OpenFile("candidates.done", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		defer doneFile.Close()
+	}
 
 	var fdupesMu sync.Mutex // protects fdupesFile writes
 	var doneMu sync.Mutex   // protects doneFile writes
 
 	writeFdupesGroup := func(paths []string) {
+		if fdupesFile == nil {
+			return
+		}
 		t := time.Now()
 		fdupesMu.Lock()
 		for _, p := range paths {
@@ -1379,6 +1388,9 @@ func main() {
 	}
 
 	writeDoneGroup := func(paths []string) {
+		if doneFile == nil {
+			return
+		}
 		t := time.Now()
 		doneMu.Lock()
 		for _, p := range paths {
