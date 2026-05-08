@@ -48,7 +48,7 @@ var (
 	DEDUPE_RANGE_INFO_SIZE = int(C.DEDUPE_RANGE_INFO_SIZE)
 )
 
-const VERSION = "1.5.0"
+const VERSION = "1.5.1"
 
 const (
 	QUEUE_LIMIT    = 10000
@@ -1005,7 +1005,9 @@ func main() {
 				fmt.Fprintf(debugFile, "[%s] %s\n", time.Now().Format("15:04:05.000"), fmt.Sprintf(format, args...))
 			}
 			defer debugFile.Close()
-			debugLog("debug started: threshold=%dms workers=%d", *debugMs, *workers)
+			fmt.Fprintf(debugFile, "═══════════════════════════════════════════════════════════════════════════════\n")
+			debugLog("debug started: threshold=%dms workers=%d version=%s", *debugMs, *workers, VERSION)
+			fmt.Fprintf(debugFile, "═══════════════════════════════════════════════════════════════════════════════\n")
 		}
 	} else {
 		debugLog = func(format string, args ...interface{}) {} // noop
