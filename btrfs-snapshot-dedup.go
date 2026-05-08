@@ -467,7 +467,11 @@ func fideduperange(srcPath string, dstPaths []string, fileSize int64, dbg debugT
 	}
 
 	// Readahead source into page cache (async, non-blocking)
+	t = time.Now()
 	syscall.Syscall(syscall.SYS_READAHEAD, uintptr(srcFd), 0, uintptr(srcSize))
+	if dbg != nil {
+		dbg(t, "readahead src %s (%s)", srcPath, fmtBytesStatic(srcSize))
+	}
 
 	// Get phys addr for each dest and sort by it
 	type destEntry struct {
@@ -496,10 +500,14 @@ func fideduperange(srcPath string, dstPaths []string, fileSize int64, dbg debugT
 		}
 
 		// Readahead dest (async)
+		tRA := time.Now()
 		dstFd, err := syscall.Open(d.path, syscall.O_RDONLY, 0)
 		if err == nil {
 			syscall.Syscall(syscall.SYS_READAHEAD, uintptr(dstFd), 0, uintptr(srcSize))
 			syscall.Close(dstFd)
+			if dbg != nil {
+				dbg(tRA, "readahead dst %s", d.path)
+			}
 		}
 
 		n, bytesDeduped, err := dedupSingle(srcFd, srcSize, d.path, dbg)
