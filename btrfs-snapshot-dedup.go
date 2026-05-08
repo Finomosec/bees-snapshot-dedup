@@ -482,25 +482,21 @@ func fideduperange(srcPath string, dstPaths []string, fileSize int64, dbg debugT
 		return 0, 0, nil
 	}
 
-	// Prefetch source into page cache via pread (brute force).
-	// fadvise/readahead may be ignored by btrfs (low ioprio, discarded).
-	// pread into dummy buffer forces pages into cache synchronously.
-	t = time.Now()
-	prefetchIntoCache(srcFd, srcSize)
-	if dbg != nil {
-		dbg(t, "[%s] prefetch src %s", fmtBytesStatic(srcSize), srcPath)
-	}
-
-	// Background goroutine: re-read source periodically to keep it in page cache.
-	// Without this, source pages get evicted while processing many dests.
+	// Background goroutine: prefetch source into page cache via pread (brute force),
+	// then re-read every 5s to keep it hot. Initial read runs parallel with first
+	// dest prefetch. fadvise/readahead may be ignored by btrfs (low ioprio).
 	stopRefresh := make(chan struct{})
 	go func() {
 		for {
+			t0 := time.Now()
+			prefetchIntoCache(srcFd, srcSize)
+			if dbg != nil {
+				dbg(t0, "[%s] prefetch src %s", fmtBytesStatic(srcSize), srcPath)
+			}
 			select {
 			case <-stopRefresh:
 				return
 			case <-time.After(5 * time.Second):
-				prefetchIntoCache(srcFd, srcSize)
 			}
 		}
 	}()
