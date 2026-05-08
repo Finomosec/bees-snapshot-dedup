@@ -48,7 +48,7 @@ var (
 	DEDUPE_RANGE_INFO_SIZE = int(C.DEDUPE_RANGE_INFO_SIZE)
 )
 
-const VERSION = "1.2.0"
+const VERSION = "1.3.0"
 
 const (
 	QUEUE_LIMIT    = 10000
@@ -395,6 +395,22 @@ func sizeCategory(size int64) int {
 // debugTimedFn is a function type for debug timing. nil = no debug.
 type debugTimedFn func(start time.Time, format string, args ...interface{}) time.Duration
 
+// prefetchIntoCache reads the file into page cache via pread into a dummy buffer.
+// btrfs may ignore fadvise/readahead (low ioprio), so brute-force pread is needed.
+func prefetchIntoCache(fd int, size int64) {
+	const chunkSize = 128 * 1024 // 128KB per pread
+	dummy := make([]byte, chunkSize)
+	var off int64
+	for off < size {
+		n := size - off
+		if n > chunkSize {
+			n = chunkSize
+		}
+		syscall.Pread(fd, dummy[:n], off)
+		off += n
+	}
+}
+
 // dedupSingle calls FIDEDUPERANGE for a single dest against an open src fd.
 // Returns (1 if deduped, bytes_deduped from kernel, error).
 func dedupSingle(srcFd int, srcSize int64, dstPath string, dbg debugTimedFn) (int, int64, error) {
@@ -463,16 +479,13 @@ func fideduperange(srcPath string, dstPaths []string, fileSize int64, dbg debugT
 		return 0, 0, nil
 	}
 
-	// Prefetch source into page cache (async, non-blocking)
-	// fadvise WILLNEED has no size limit unlike readahead (limited by read_ahead_kb)
+	// Prefetch source into page cache via pread (brute force).
+	// fadvise/readahead may be ignored by btrfs (low ioprio, discarded).
+	// pread into dummy buffer forces pages into cache synchronously.
 	t = time.Now()
-	_, _, errno := syscall.Syscall6(syscall.SYS_FADVISE64, uintptr(srcFd), 0, uintptr(srcSize), 3 /*FADV_WILLNEED*/, 0, 0)
-	if errno != 0 {
-		if dbg != nil {
-			dbg(t, "fadvise src FAILED: errno=%d %s", errno, srcPath)
-		}
-	} else if dbg != nil {
-		dbg(t, "fadvise src %s (%s)", srcPath, fmtBytesStatic(srcSize))
+	prefetchIntoCache(srcFd, srcSize)
+	if dbg != nil {
+		dbg(t, "[%s] prefetch src %s", fmtBytesStatic(srcSize), srcPath)
 	}
 
 	// Get phys addr for each dest and sort by it
@@ -501,19 +514,15 @@ func fideduperange(srcPath string, dstPaths []string, fileSize int64, dbg debugT
 			continue // content differs for this phys addr — skip
 		}
 
-		// Prefetch dest into page cache (async, non-blocking)
+		// Prefetch dest into page cache via pread (brute force)
 		tRA := time.Now()
 		dstFd, err := syscall.Open(d.path, syscall.O_RDONLY, 0)
 		if err == nil {
-			_, _, eno := syscall.Syscall6(syscall.SYS_FADVISE64, uintptr(dstFd), 0, uintptr(srcSize), 3 /*FADV_WILLNEED*/, 0, 0)
-			if eno != 0 {
-				if dbg != nil {
-					dbg(tRA, "fadvise dst FAILED: errno=%d %s", eno, d.path)
-				}
-			} else if dbg != nil {
-				dbg(tRA, "fadvise dst %s", d.path)
-			}
+			prefetchIntoCache(dstFd, srcSize)
 			syscall.Close(dstFd)
+			if dbg != nil {
+				dbg(tRA, "[%s] prefetch dst %s", fmtBytesStatic(srcSize), d.path)
+			}
 		}
 
 		n, bytesDeduped, err := dedupSingle(srcFd, srcSize, d.path, dbg)
