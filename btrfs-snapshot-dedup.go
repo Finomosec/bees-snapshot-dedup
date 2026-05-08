@@ -400,11 +400,19 @@ type debugTimedFn func(start time.Time, format string, args ...interface{}) time
 
 // prefetchIntoCache reads the file into page cache via pread into a dummy buffer.
 // btrfs may ignore fadvise/readahead (low ioprio), so brute-force pread is needed.
-func prefetchIntoCache(fd int, size int64) {
+// If stop channel is provided and closed, aborts mid-read.
+func prefetchIntoCache(fd int, size int64, stop <-chan struct{}) {
 	const chunkSize = 128 * 1024 // 128KB per pread
 	dummy := make([]byte, chunkSize)
 	var off int64
 	for off < size {
+		if stop != nil {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+		}
 		n := size - off
 		if n > chunkSize {
 			n = chunkSize
@@ -489,7 +497,7 @@ func fideduperange(srcPath string, dstPaths []string, fileSize int64, dbg debugT
 	go func() {
 		for {
 			t0 := time.Now()
-			prefetchIntoCache(srcFd, srcSize)
+			prefetchIntoCache(srcFd, srcSize, stopRefresh)
 			if dbg != nil {
 				dbg(t0, "[%s] prefetch src %s", fmtBytesStatic(srcSize), srcPath)
 			}
@@ -531,7 +539,7 @@ func fideduperange(srcPath string, dstPaths []string, fileSize int64, dbg debugT
 		tRA := time.Now()
 		dstFd, err := syscall.Open(d.path, syscall.O_RDONLY, 0)
 		if err == nil {
-			prefetchIntoCache(dstFd, srcSize)
+			prefetchIntoCache(dstFd, srcSize, nil)
 			syscall.Close(dstFd)
 			if dbg != nil {
 				dbg(tRA, "[%s] prefetch dst %s", fmtBytesStatic(srcSize), d.path)
