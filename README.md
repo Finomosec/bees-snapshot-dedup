@@ -144,4 +144,4 @@ Multiple snapshot copies often share the same physical extent (COW), so deduplic
 
 ## License
 
-GPL-2.0 (same as bees)
+GPL-2.0
