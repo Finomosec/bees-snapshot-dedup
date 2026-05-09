@@ -138,6 +138,7 @@ Multiple snapshot copies often share the same physical extent (COW), so deduplic
 
 ## Related
 
+- [btrfs-snapshot-compress](https://github.com/Finomosec/btrfs-snapshot-compress) — Sister project: zstd-compress existing data while preserving snapshots and reflinks (no temporary disk-grow, no `btrfs send` breakage). Compose with this tool for compress + dedup workflows.
 - [bees](https://github.com/Zygo/bees) — btrfs deduplication daemon
 - [duperemove](https://github.com/markfasheh/duperemove) — Hash-based btrfs deduplication tool
 
