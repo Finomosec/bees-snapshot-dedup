@@ -1344,7 +1344,7 @@ func main() {
 	}()
 
 	// Output files
-	logFile, _ := os.OpenFile("bees-snapshot-dedup.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	logFile, _ := os.OpenFile("btrfs-snapshot-dedup.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	defer logFile.Close()
 
 	// Optional candidate files (--write-candidates)
