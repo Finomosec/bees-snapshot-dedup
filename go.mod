@@ -1,3 +1,3 @@
-module github.com/Finomosec/bees-snapshot-dedup
+module github.com/Finomosec/btrfs-snapshot-dedup
 
 go 1.22.2
